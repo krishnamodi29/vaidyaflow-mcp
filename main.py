@@ -12,10 +12,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 FHIR_BASE = os.getenv("FHIR_BASE_URL", "https://hapi.fhir.org/baseR4")
+PORT = int(os.getenv("PORT", 8000))
 
 mcp = FastMCP(
     "VaidyaFlow OPD Co-Pilot",
     json_response=True,
+    host="0.0.0.0",
+    port=PORT,
+    streamable_http_path="/mcp",
     instructions=(
         "AI-powered patient safety tools for high-volume OPD clinicians. "
         "Surfaces medication risks, flags abnormal labs, generates 10-second "
@@ -347,5 +351,7 @@ async def generate_handoff_note(patient_id: str, handoff_notes: str = "") -> str
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
+    mcp.run(transport="streamable-http")
+
+# ── ASGI app for uvicorn (Railway) ────────────────────────────────────────────
+app = mcp.streamable_http_app()
