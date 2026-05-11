@@ -352,77 +352,62 @@ async def load_patient_from_context(explicit_patient_id: str = "") -> dict:
 
 
 async def parse_document_text(documents: list, fhir_base: str = None, token: str = None, max_docs: int = 5) -> str:
-    """Extract text content from DocumentReference resources.
-    
-    Handles multiple FHIR storage formats:
-    - attachment.data: base64-encoded inline text
-    - attachment.url: pointer to a separate Binary resource (we fetch it)
-    - text.div: narrative HTML/text
-    """
+    """Extract text from DocumentReference resources — handles all FHIR formats."""
     import base64
     chunks = []
+
     for entry in documents[:max_docs]:
         res = entry.get("resource", {})
-        
-        # Try the narrative text (FHIR text.div field)
-        narrative = res.get("text", {}).get("div", "")
-        if narrative:
-            chunks.append(narrative)
-        
-        # Iterate content[] for attachments
+
+        # Format 1: base64 inline data in content[].attachment.data
         for content in res.get("content", []):
             attach = content.get("attachment", {})
-            
-            # Format 1: base64 inline data
             data = attach.get("data")
             if data:
                 try:
-                    text = base64.b64decode(data).decode("utf-8", errors="ignore")
-                    if text.strip():
+                    text = base64.b64decode(data + "==").decode("utf-8", errors="ignore").strip()
+                    if len(text) > 20:
                         chunks.append(text)
                         continue
                 except Exception:
                     pass
-            
-            # Format 2: URL pointing to Binary resource — fetch it
-            url = attach.get("url")
+
+            # Format 2: URL pointing to Binary resource
+            url = attach.get("url", "")
             if url and fhir_base:
                 try:
-                    # URL may be absolute or relative (e.g., "Binary/abc123")
-                    if url.startswith("http"):
-                        fetch_url = url
-                    else:
-                        fetch_url = f"{fhir_base}/{url.lstrip('/')}"
-                    headers = {"Accept": "application/fhir+json"}
+                    fetch_url = url if url.startswith("http") else f"{fhir_base}/{url.lstrip('/')}"
+                    hdrs = {"Accept": "application/fhir+json, text/plain, */*"}
                     if token:
-                        headers["Authorization"] = f"Bearer {token}"
+                        hdrs["Authorization"] = f"Bearer {token}"
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        r = await client.get(fetch_url, headers=headers)
+                        r = await client.get(fetch_url, headers=hdrs)
                         if r.status_code == 200:
-                            # Try parsing as Binary FHIR resource
                             try:
-                                binary = r.json()
-                                if binary.get("data"):
-                                    text = base64.b64decode(binary["data"]).decode("utf-8", errors="ignore")
-                                    if text.strip():
+                                b = r.json()
+                                raw = b.get("data") or b.get("content") or ""
+                                if raw:
+                                    text = base64.b64decode(raw + "==").decode("utf-8", errors="ignore").strip()
+                                    if len(text) > 20:
                                         chunks.append(text)
                                         continue
                             except Exception:
-                                # Plain text response
-                                if r.text.strip():
-                                    chunks.append(r.text)
+                                if len(r.text) > 20:
+                                    chunks.append(r.text.strip())
                                     continue
                 except Exception:
                     pass
-            
-            # Format 3: title or description as a fallback
-            if attach.get("title"):
-                chunks.append(attach.get("title", ""))
-        
-        # Some FHIR servers put description at top level
-        if res.get("description"):
-            chunks.append(res.get("description"))
-    
+
+        # Format 3: narrative text.div
+        div = res.get("text", {}).get("div", "")
+        if div and len(div) > 30:
+            chunks.append(div)
+
+        # Format 4: description field
+        desc = res.get("description", "")
+        if desc and len(desc) > 20:
+            chunks.append(desc)
+
     return "\n\n---\n\n".join(c for c in chunks if c.strip())
 
 
