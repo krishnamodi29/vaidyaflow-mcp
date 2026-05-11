@@ -169,37 +169,39 @@ LAB_NOTES = {
 
 
 # ── SHARP context reader ───────────────────────────────────────────────────────
-# Prompt Opinion passes FHIR context via HTTP headers per SHARP spec:
-#   X-FHIR-Base-URL : URL of the FHIR server (Prompt Opinion's workspace FHIR)
-#   X-FHIR-Token    : OAuth bearer token for that FHIR server
-#   X-Patient-Id    : ID of the currently-selected patient
+# Prompt Opinion sends FHIR context via HTTP headers (SHARP spec):
+#   x-fhir-server-url   : PO internal FHIR server base URL
+#   x-fhir-access-token : bearer token
+#   x-patient-id        : currently-selected patient UUID
 #
-# When the agent invokes an MCP tool, these headers come with the request,
-# so we can fetch the *correct* patient's data from the *correct* FHIR server
-# even though we don't pass patient_id as an argument.
+# FastMCP does not expose raw Starlette requests inside tool functions,
+# so we use ASGI middleware to capture these headers into a ContextVar
+# BEFORE FastMCP handles the request.
 
-from starlette.requests import Request
+import contextvars
+
+_sharp_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("sharp_ctx", default={})
+
+
+class SharpContextMiddleware:
+    """ASGI middleware: reads SHARP headers into ContextVar on every request."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            raw_headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            _sharp_ctx.set({
+                "fhir_base":  raw_headers.get(b"x-fhir-server-url",   b"").decode() or None,
+                "fhir_token": raw_headers.get(b"x-fhir-access-token", b"").decode() or None,
+                "patient_id": raw_headers.get(b"x-patient-id",        b"").decode() or None,
+            })
+        await self.app(scope, receive, send)
+
 
 def get_sharp_context() -> dict:
-    """Read SHARP context from the current HTTP request headers.
-    
-    Per Prompt Opinion's official SHARP spec, the platform passes:
-      - x-fhir-server-url  : base URL of the FHIR server
-      - x-fhir-access-token: bearer token for that FHIR server  
-      - x-patient-id       : ID of the currently-selected patient
-    """
-    try:
-        req: Request = mcp.get_context().request_context.request
-        if req is None:
-            return {}
-        headers = req.headers
-        return {
-            "fhir_base":  headers.get("x-fhir-server-url"),
-            "fhir_token": headers.get("x-fhir-access-token"),
-            "patient_id": headers.get("x-patient-id"),
-        }
-    except Exception:
-        return {}
+    """Return SHARP context captured by middleware for the current request."""
+    return _sharp_ctx.get()
 
 
 async def load_patient_from_context(explicit_patient_id: str = "") -> dict:
@@ -582,4 +584,5 @@ if __name__ == "__main__":
     mcp.run(transport="streamable-http")
 
 # ── ASGI app for uvicorn (Railway) ────────────────────────────────────────────
-app = mcp.streamable_http_app()
+# Wrap with SharpContextMiddleware so SHARP headers are captured before tool calls
+app = SharpContextMiddleware(mcp.streamable_http_app())
