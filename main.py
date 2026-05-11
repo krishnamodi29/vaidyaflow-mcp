@@ -168,52 +168,86 @@ LAB_NOTES = {
 }
 
 
-# ── Demo patient (rich data fallback for live demos) ──────────────────────────
-# Used when FHIR returns no data — typical in hackathon sandbox environments
-# where synthetic patients lack populated Condition/Medication/Lab resources.
-# Models a realistic high-risk OPD patient: Indian govt hospital scenario.
+# ── SHARP context reader ───────────────────────────────────────────────────────
+# Prompt Opinion passes FHIR context via HTTP headers per SHARP spec:
+#   X-FHIR-Base-URL : URL of the FHIR server (Prompt Opinion's workspace FHIR)
+#   X-FHIR-Token    : OAuth bearer token for that FHIR server
+#   X-Patient-Id    : ID of the currently-selected patient
+#
+# When the agent invokes an MCP tool, these headers come with the request,
+# so we can fetch the *correct* patient's data from the *correct* FHIR server
+# even though we don't pass patient_id as an argument.
 
-DEMO_PATIENT = {
-    "name":       "Ramesh Patel",
-    "sex":        "Male",
-    "dob":        "1968-03-12",
-    "age":        58,
-    "last_visit": "2026-04-28",
-    "conditions": [
-        "Chronic Kidney Disease (CKD) Stage 2",
-        "Type 2 Diabetes Mellitus",
-        "Essential Hypertension",
-        "Hyperlipidemia",
-    ],
-    "medications": [
-        "Amlodipine 5mg once daily",
-        "Metformin 500mg twice daily",
-        "Atorvastatin 20mg at night",
-        "Warfarin 3mg once daily (INR target 2-3)",
-    ],
-    "allergies": ["Penicillin", "Sulfa drugs"],
-    "abnormal_labs": [
-        {"name": "Creatinine",  "value": "1.6 mg/dL",   "date": "2026-04-28", "flag": "H"},
-        {"name": "HbA1c",       "value": "8.2 %",       "date": "2026-04-20", "flag": "H"},
-        {"name": "Potassium",   "value": "5.4 mmol/L",  "date": "2026-04-28", "flag": "H"},
-        {"name": "INR",         "value": "3.4",         "date": "2026-04-28", "flag": "H"},
-    ],
-    "normal_labs": [
-        {"name": "Hemoglobin",  "value": "13.2 g/dL",   "date": "2026-04-28", "flag": ""},
-        {"name": "Sodium",      "value": "139 mmol/L",  "date": "2026-04-28", "flag": ""},
-        {"name": "Platelets",   "value": "240 x10^9/L", "date": "2026-04-28", "flag": ""},
-    ],
-}
+from starlette.requests import Request
+
+def get_sharp_context() -> dict:
+    """Read SHARP context from the current HTTP request headers."""
+    try:
+        req: Request = mcp.get_context().request_context.request
+        if req is None:
+            return {}
+        headers = req.headers
+        return {
+            "fhir_base":  headers.get("x-fhir-base-url") or headers.get("x-fhir-base"),
+            "fhir_token": headers.get("x-fhir-token") or headers.get("authorization", "").replace("Bearer ", ""),
+            "patient_id": headers.get("x-patient-id") or headers.get("x-fhir-patient-id"),
+        }
+    except Exception:
+        return {}
 
 
-def use_demo_patient(d: dict) -> bool:
-    """True when the FHIR fetch returned nothing useful — fall back to demo data."""
-    return (
-        not d.get("patient")
-        and not d.get("conditions")
-        and not d.get("medications")
-        and not d.get("observations")
-    )
+async def load_patient_from_context(explicit_patient_id: str = "") -> dict:
+    """
+    Load patient data using SHARP context from request headers.
+    Falls back to explicit patient_id if provided. Uses FHIR base URL from
+    SHARP context (Prompt Opinion's workspace FHIR) if available, else HAPI.
+    """
+    ctx = get_sharp_context()
+    pid = explicit_patient_id or ctx.get("patient_id")
+    base = ctx.get("fhir_base") or FHIR_BASE
+    token = ctx.get("fhir_token")
+
+    if not pid:
+        return {"patient": {}, "conditions": [], "medications": [], "observations": [], "allergies": [], "encounters": []}
+
+    p    = await fhir_get(f"Patient/{pid}", base, token)
+    cond = await fhir_get(f"Condition?patient={pid}", base, token)
+    meds = await fhir_get(f"MedicationRequest?patient={pid}", base, token)
+    obs  = await fhir_get(f"Observation?patient={pid}&_sort=-date&_count=20", base, token)
+    alrg = await fhir_get(f"AllergyIntolerance?patient={pid}", base, token)
+    enc  = await fhir_get(f"Encounter?patient={pid}&_sort=-date&_count=3", base, token)
+    docs = await fhir_get(f"DocumentReference?patient={pid}&_sort=-date&_count=5", base, token)
+    return {
+        "patient":      p,
+        "patient_id":   pid,
+        "conditions":   cond.get("entry", []),
+        "medications":  meds.get("entry", []),
+        "observations": obs.get("entry", []),
+        "allergies":    alrg.get("entry", []),
+        "encounters":   enc.get("entry", []),
+        "documents":    docs.get("entry", []),
+    }
+
+
+def parse_document_text(documents: list, max_docs: int = 3) -> str:
+    """Extract text content from DocumentReference resources."""
+    import base64
+    chunks = []
+    for entry in documents[:max_docs]:
+        res = entry.get("resource", {})
+        for content in res.get("content", []):
+            attach = content.get("attachment", {})
+            data = attach.get("data")
+            if data:
+                try:
+                    text = base64.b64decode(data).decode("utf-8", errors="ignore")
+                    chunks.append(text)
+                except Exception:
+                    pass
+            # Some FHIR servers inline text directly
+            if attach.get("title"):
+                chunks.append(attach.get("title", ""))
+    return "\n\n---\n\n".join(chunks)
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
@@ -221,60 +255,28 @@ def use_demo_patient(d: dict) -> bool:
 @mcp.tool()
 async def get_patient_brief(patient_id: str = "") -> str:
     """
-    Generate a 10-second patient brief for a doctor seeing this patient.
-    Returns active conditions, current medications, recent labs, allergy flags,
-    and safety alerts in one structured card. Built for high-volume OPD clinics
-    where doctors see 80-120 patients per shift. Patient_id is optional —
-    if not provided or no FHIR data is found, returns a representative high-risk
-    OPD patient for demonstration.
+    Generate a 10-second patient brief for the doctor seeing this patient.
+    Automatically uses the patient from SHARP context (the currently-selected
+    patient in the Prompt Opinion workspace). Reads structured FHIR resources
+    AND unstructured clinical notes attached to the patient. Returns conditions,
+    medications, recent labs, allergies, and safety flags in one structured card.
+    Built for high-volume OPD clinics where doctors see 80-120 patients per shift.
     """
-    d = await load_patient(patient_id) if patient_id else {}
-
-    if use_demo_patient(d):
-        # Fall back to rich demo patient — typical CKD + diabetes + cardiac risk OPD case
-        dp = DEMO_PATIENT
-        safety = []
-        for c in dp["conditions"]:
-            if "kidney" in c.lower() or "ckd" in c.lower():
-                safety.append("⚠️ Avoid NSAIDs, Gentamicin, Nitrofurantoin, IV contrast")
-            if "diabetes" in c.lower():
-                safety.append("⚠️ Monitor glucose before steroid Rx")
-        return "\n".join([
-            "╔══════════════════════════════════════════════════╗",
-            "║           VAIDYAFLOW 10-SECOND BRIEF             ║",
-            "╚══════════════════════════════════════════════════╝",
-            f"PATIENT : {dp['name']} | {dp['sex']} | DOB {dp['dob']} (age {dp['age']})",
-            f"LAST VISIT: {dp['last_visit']}",
-            "",
-            f"── ACTIVE CONDITIONS ({len(dp['conditions'])}) " + "─"*26,
-            *[f"• {c}" for c in dp["conditions"]],
-            "",
-            f"── CURRENT MEDICATIONS ({len(dp['medications'])}) " + "─"*23,
-            *[f"• {m}" for m in dp["medications"]],
-            "",
-            f"── ALLERGIES ({len(dp['allergies'])}) " + "─"*32,
-            *[f"• {a}" for a in dp["allergies"]],
-            "",
-            f"── ABNORMAL LABS ({len(dp['abnormal_labs'])}) " + "─"*29,
-            *[f"⚠ {l['name']}: {l['value']} ({l['date']})" for l in dp["abnormal_labs"]],
-            "",
-            "── PRESCRIBING SAFETY FLAGS " + "─"*20,
-            *safety,
-            "",
-            "══════════════════════════════════════════════════",
-            "VaidyaFlow | Agents Assemble 2026 | Synthetic data",
-        ])
-
+    d = await load_patient_from_context(patient_id)
     p    = d["patient"]
     cond = parse_conditions(d["conditions"])
     meds = parse_meds(d["medications"])
     labs = parse_labs(d["observations"])
     alrg = parse_allergies(d["allergies"])
     abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+    doc_text = parse_document_text(d.get("documents", []))
     last = (d["encounters"][0].get("resource",{}).get("period",{}).get("start","N/A")[:10]
             if d["encounters"] else "No visits on record")
 
-    return "\n".join([
+    if not p:
+        return "Unable to load patient data. No patient context available — please select a patient in the workspace."
+
+    sections = [
         "╔══════════════════════════════════════════════════╗",
         "║           VAIDYAFLOW 10-SECOND BRIEF             ║",
         "╚══════════════════════════════════════════════════╝",
@@ -282,10 +284,10 @@ async def get_patient_brief(patient_id: str = "") -> str:
         f"LAST VISIT: {last}",
         "",
         f"── CONDITIONS ({len(cond)}) " + "─"*30,
-        *([f"• {c}" for c in cond] or ["• None recorded"]),
+        *([f"• {c}" for c in cond] or ["• None in structured FHIR resources"]),
         "",
         f"── MEDICATIONS ({len(meds)}) " + "─"*29,
-        *([f"• {m}" for m in meds] or ["• None recorded"]),
+        *([f"• {m}" for m in meds] or ["• None in structured FHIR resources"]),
         "",
         "── ALLERGIES " + "─"*35,
         *([f"• {a}" for a in alrg] or ["• NKDA"]),
@@ -295,34 +297,65 @@ async def get_patient_brief(patient_id: str = "") -> str:
         "",
         "── SAFETY FLAGS " + "─"*32,
         *safety_flags_from(cond),
+    ]
+
+    if doc_text:
+        sections += [
+            "",
+            "── CLINICAL NOTES (from uploaded documents) " + "─"*4,
+            doc_text[:2000],
+        ]
+
+    sections += [
         "",
         "══════════════════════════════════════════════════",
         "VaidyaFlow | Agents Assemble 2026 | Synthetic data",
-    ])
+    ]
+    return "\n".join(sections)
 
 
 @mcp.tool()
 async def check_prescription_safety(proposed_medication: str, patient_id: str = "") -> str:
     """
     Check if a proposed medication is safe for the current patient given their
-    conditions, medications, and allergies. Returns a clear verdict with
-    contraindication reasoning and safer alternatives. Prevents medication errors
-    in busy OPD. patient_id is optional — uses current patient context if available,
-    otherwise demonstrates with a representative high-risk OPD patient.
+    conditions, medications, and allergies. Automatically uses the patient from
+    SHARP context. Returns a clear verdict with contraindication reasoning and
+    safer alternatives. Prevents medication errors in busy OPD.
     """
-    d    = await load_patient(patient_id) if patient_id else {}
+    d    = await load_patient_from_context(patient_id)
+    cond = parse_conditions(d["conditions"])
+    meds = parse_meds(d["medications"])
+    alrg = parse_allergies(d["allergies"])
+    doc_text = parse_document_text(d.get("documents", []))
 
-    if use_demo_patient(d):
-        cond = DEMO_PATIENT["conditions"]
-        meds = DEMO_PATIENT["medications"]
-        alrg = DEMO_PATIENT["allergies"]
-    else:
-        cond = parse_conditions(d["conditions"])
-        meds = parse_meds(d["medications"])
-        alrg = parse_allergies(d["allergies"])
+    # Also scan clinical notes for conditions/allergies mentioned in free text
+    doc_lower = doc_text.lower()
+    conditions_from_notes = []
+    allergies_from_notes = []
+    for keyword, label in [
+        ("chronic kidney", "Chronic Kidney Disease (from notes)"),
+        ("ckd", "Chronic Kidney Disease (from notes)"),
+        ("diabetes", "Diabetes (from notes)"),
+        ("hypertension", "Hypertension (from notes)"),
+        ("asthma", "Asthma (from notes)"),
+        ("copd", "COPD (from notes)"),
+        ("peptic ulcer", "Peptic Ulcer (from notes)"),
+        ("heart failure", "Heart Failure (from notes)"),
+        ("warfarin", "On Warfarin (from notes)"),
+    ]:
+        if keyword in doc_lower and label not in conditions_from_notes:
+            conditions_from_notes.append(label)
+    # Pull allergy mentions
+    if "allerg" in doc_lower:
+        for allergen in ["penicillin", "sulfa", "ibuprofen", "aspirin", "nsaid"]:
+            if allergen in doc_lower:
+                allergies_from_notes.append(allergen.title())
 
-    warns, alts = drug_check(proposed_medication, cond)
-    allergy_hits = [f"🚨 ALLERGY: documented allergy to {a}" for a in alrg
+    cond_all = cond + conditions_from_notes
+    alrg_all = alrg + allergies_from_notes
+
+    warns, alts = drug_check(proposed_medication, cond_all)
+    allergy_hits = [f"🚨 ALLERGY: documented allergy to {a}" for a in alrg_all
                     if proposed_medication.lower() in a.lower() or a.lower() in proposed_medication.lower()]
     dup_hits     = [f"📋 Already on: {m}" for m in meds if proposed_medication.lower() in m.lower()]
 
@@ -346,8 +379,8 @@ async def check_prescription_safety(proposed_medication: str, patient_id: str = 
         lines += ["", f"SAFER ALTERNATIVES: {', '.join(alts)}"]
     lines += [
         "",
-        f"Patient conditions : {', '.join(cond) or 'None'}",
-        f"Patient allergies  : {', '.join(alrg) or 'NKDA'}",
+        f"Patient conditions : {', '.join(cond_all) or 'None'}",
+        f"Patient allergies  : {', '.join(alrg_all) or 'NKDA'}",
         "",
         "VaidyaFlow | Agents Assemble 2026 | Synthetic data",
     ]
@@ -358,21 +391,14 @@ async def check_prescription_safety(proposed_medication: str, patient_id: str = 
 async def get_abnormal_labs(patient_id: str = "") -> str:
     """
     Retrieve and interpret the patient's most recent lab results, flagging
-    abnormal values with clinical context and action guidance. Helps doctors
-    spot critical values without manually reviewing every lab result.
-    patient_id is optional — uses current patient or demo patient.
+    abnormal values with clinical context and action guidance. Automatically
+    uses the patient from SHARP context.
     """
-    d    = await load_patient(patient_id) if patient_id else {}
-
-    if use_demo_patient(d):
-        abn  = DEMO_PATIENT["abnormal_labs"]
-        norm = DEMO_PATIENT["normal_labs"]
-        total = len(abn) + len(norm)
-    else:
-        labs = parse_labs(d["observations"])
-        abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
-        norm = [l for l in labs if l not in abn]
-        total = len(labs)
+    d    = await load_patient_from_context(patient_id)
+    labs = parse_labs(d["observations"])
+    abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+    norm = [l for l in labs if l not in abn]
+    total = len(labs)
 
     abn_lines = []
     for l in abn:
@@ -397,31 +423,25 @@ async def get_abnormal_labs(patient_id: str = "") -> str:
 @mcp.tool()
 async def generate_handoff_note(patient_id: str = "", handoff_notes: str = "") -> str:
     """
-    Generate a structured clinical handoff note for shift change. Summarises
-    the patient's key context, active issues, and priority actions for the
-    incoming doctor. Prevents critical information loss during transitions —
-    a leading cause of preventable adverse events in hospitals.
-    patient_id is optional.
+    Generate a structured clinical handoff note for shift change. Automatically
+    uses the patient from SHARP context. Summarises the patient's key context,
+    active issues, and priority actions for the incoming doctor. Prevents
+    critical information loss during transitions.
     """
-    d = await load_patient(patient_id) if patient_id else {}
+    d = await load_patient_from_context(patient_id)
+    p    = d["patient"]
+    name = name_of(p)
+    sex  = p.get("gender", "?").title()
+    dob  = p.get("birthDate", "?")
+    cond = parse_conditions(d["conditions"])
+    meds = parse_meds(d["medications"])
+    labs = parse_labs(d["observations"])
+    alrg = parse_allergies(d["allergies"])
+    abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+    doc_text = parse_document_text(d.get("documents", []))
 
-    if use_demo_patient(d):
-        dp = DEMO_PATIENT
-        name, sex, dob = dp["name"], dp["sex"], dp["dob"]
-        cond = dp["conditions"]
-        meds = dp["medications"]
-        alrg = dp["allergies"]
-        abn  = dp["abnormal_labs"]
-    else:
-        p    = d["patient"]
-        name = name_of(p)
-        sex  = p.get("gender", "?").title()
-        dob  = p.get("birthDate", "?")
-        cond = parse_conditions(d["conditions"])
-        meds = parse_meds(d["medications"])
-        labs = parse_labs(d["observations"])
-        alrg = parse_allergies(d["allergies"])
-        abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+    if not p:
+        return "Unable to load patient data for handoff. No patient context available."
 
     rx_flags = []
     for c in cond:
