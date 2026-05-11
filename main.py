@@ -27,6 +27,42 @@ mcp = FastMCP(
     )
 )
 
+# ── Declare PromptOpinion FHIR-context extension ──────────────────────────────
+# Per https://docs.promptopinion.ai/fhir-context/mcp-fhir-context, our MCP
+# server must advertise the `ai.promptopinion/fhir-context` extension during
+# the `initialize` handshake. Only then will PO send us the SHARP headers
+# (X-FHIR-Server-URL, X-FHIR-Access-Token, X-Patient-ID) on every tool call.
+#
+# We monkey-patch create_initialization_options on the underlying low-level
+# server to inject the experimental capability with our requested SMART scopes.
+
+_PO_FHIR_SCOPES = {
+    "scopes": [
+        {"name": "patient/Patient.rs",            "required": True},
+        {"name": "patient/Condition.rs"},
+        {"name": "patient/MedicationRequest.rs"},
+        {"name": "patient/Observation.rs"},
+        {"name": "patient/AllergyIntolerance.rs"},
+        {"name": "patient/Encounter.rs"},
+        {"name": "patient/DocumentReference.rs"},
+    ]
+}
+
+_original_create_init_opts = mcp._mcp_server.create_initialization_options
+
+def _patched_create_initialization_options(
+    notification_options=None,
+    experimental_capabilities=None,
+):
+    caps = dict(experimental_capabilities or {})
+    caps["ai.promptopinion/fhir-context"] = _PO_FHIR_SCOPES
+    return _original_create_init_opts(
+        notification_options=notification_options,
+        experimental_capabilities=caps,
+    )
+
+mcp._mcp_server.create_initialization_options = _patched_create_initialization_options
+
 # ── FHIR helpers ──────────────────────────────────────────────────────────────
 
 async def fhir_get(path: str, fhir_base: str = FHIR_BASE, token: str = None) -> dict:
