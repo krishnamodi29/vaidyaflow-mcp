@@ -261,9 +261,9 @@ def parse_document_text(documents: list, max_docs: int = 3) -> str:
 @mcp.tool()
 async def debug_show_context() -> str:
     """
-    Diagnostic tool. Returns all HTTP headers and detected SHARP context from
-    the current request. Use this to verify what Prompt Opinion is sending so
-    we know the exact header names for patient ID, FHIR base URL, and token.
+    Diagnostic tool. Returns all HTTP headers, detected SHARP context, AND
+    actually attempts FHIR fetches to show what data comes back. Use this to
+    diagnose why a patient's data isn't loading.
     """
     try:
         req: Request = mcp.get_context().request_context.request
@@ -274,6 +274,7 @@ async def debug_show_context() -> str:
         redacted = {k: ("***REDACTED***" if "token" in k.lower() or "auth" in k.lower() else v)
                     for k, v in headers.items()}
         ctx = get_sharp_context()
+        
         lines = [
             "═══════════ VAIDYAFLOW DEBUG — REQUEST CONTEXT ═══════════",
             "",
@@ -285,11 +286,63 @@ async def debug_show_context() -> str:
             f"  FHIR token    : {'***present***' if ctx.get('fhir_token') else '(not detected)'}",
             f"  Patient ID    : {ctx.get('patient_id') or '(not detected)'}",
             "",
-            "═══════════════════════════════════════════════════════════",
         ]
+        
+        # Now actually try to fetch the patient and show what comes back
+        pid = ctx.get("patient_id")
+        base = ctx.get("fhir_base") or FHIR_BASE
+        token = ctx.get("fhir_token")
+        
+        if pid:
+            lines += [
+                "── LIVE FHIR FETCH ATTEMPTS ──",
+                f"  FHIR base used      : {base}",
+                f"  Auth header sent    : {'Bearer ***' if token else 'NONE'}",
+                "",
+            ]
+            
+            # Try Patient fetch
+            try:
+                hdrs = {"Accept": "application/fhir+json"}
+                if token:
+                    hdrs["Authorization"] = f"Bearer {token}"
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.get(f"{base}/Patient/{pid}", headers=hdrs)
+                    lines += [f"  GET Patient/{pid}",
+                              f"    Status: {r.status_code}",
+                              f"    Body  : {r.text[:300]}",
+                              ""]
+            except Exception as e:
+                lines += [f"  Patient fetch error: {e!r}", ""]
+            
+            # Try Condition search
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.get(f"{base}/Condition?patient={pid}", headers=hdrs)
+                    lines += [f"  GET Condition?patient={pid}",
+                              f"    Status: {r.status_code}",
+                              f"    Body  : {r.text[:300]}",
+                              ""]
+            except Exception as e:
+                lines += [f"  Condition fetch error: {e!r}", ""]
+            
+            # Try DocumentReference search
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    r = await client.get(f"{base}/DocumentReference?patient={pid}", headers=hdrs)
+                    lines += [f"  GET DocumentReference?patient={pid}",
+                              f"    Status: {r.status_code}",
+                              f"    Body  : {r.text[:300]}",
+                              ""]
+            except Exception as e:
+                lines += [f"  DocumentReference fetch error: {e!r}", ""]
+        else:
+            lines += ["(No patient ID — skipping FHIR fetch tests)", ""]
+        
+        lines += ["═══════════════════════════════════════════════════════════"]
         return "\n".join(lines)
     except Exception as e:
-        return f"Error reading request context: {e!r}"
+        return f"Error in debug tool: {e!r}"
 
 
 @mcp.tool()
