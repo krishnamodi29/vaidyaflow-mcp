@@ -168,17 +168,103 @@ LAB_NOTES = {
 }
 
 
+# ── Demo patient (rich data fallback for live demos) ──────────────────────────
+# Used when FHIR returns no data — typical in hackathon sandbox environments
+# where synthetic patients lack populated Condition/Medication/Lab resources.
+# Models a realistic high-risk OPD patient: Indian govt hospital scenario.
+
+DEMO_PATIENT = {
+    "name":       "Ramesh Patel",
+    "sex":        "Male",
+    "dob":        "1968-03-12",
+    "age":        58,
+    "last_visit": "2026-04-28",
+    "conditions": [
+        "Chronic Kidney Disease (CKD) Stage 2",
+        "Type 2 Diabetes Mellitus",
+        "Essential Hypertension",
+        "Hyperlipidemia",
+    ],
+    "medications": [
+        "Amlodipine 5mg once daily",
+        "Metformin 500mg twice daily",
+        "Atorvastatin 20mg at night",
+        "Warfarin 3mg once daily (INR target 2-3)",
+    ],
+    "allergies": ["Penicillin", "Sulfa drugs"],
+    "abnormal_labs": [
+        {"name": "Creatinine",  "value": "1.6 mg/dL",   "date": "2026-04-28", "flag": "H"},
+        {"name": "HbA1c",       "value": "8.2 %",       "date": "2026-04-20", "flag": "H"},
+        {"name": "Potassium",   "value": "5.4 mmol/L",  "date": "2026-04-28", "flag": "H"},
+        {"name": "INR",         "value": "3.4",         "date": "2026-04-28", "flag": "H"},
+    ],
+    "normal_labs": [
+        {"name": "Hemoglobin",  "value": "13.2 g/dL",   "date": "2026-04-28", "flag": ""},
+        {"name": "Sodium",      "value": "139 mmol/L",  "date": "2026-04-28", "flag": ""},
+        {"name": "Platelets",   "value": "240 x10^9/L", "date": "2026-04-28", "flag": ""},
+    ],
+}
+
+
+def use_demo_patient(d: dict) -> bool:
+    """True when the FHIR fetch returned nothing useful — fall back to demo data."""
+    return (
+        not d.get("patient")
+        and not d.get("conditions")
+        and not d.get("medications")
+        and not d.get("observations")
+    )
+
+
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def get_patient_brief(patient_id: str) -> str:
+async def get_patient_brief(patient_id: str = "") -> str:
     """
     Generate a 10-second patient brief for a doctor seeing this patient.
     Returns active conditions, current medications, recent labs, allergy flags,
     and safety alerts in one structured card. Built for high-volume OPD clinics
-    where doctors see 80-120 patients per shift.
+    where doctors see 80-120 patients per shift. Patient_id is optional —
+    if not provided or no FHIR data is found, returns a representative high-risk
+    OPD patient for demonstration.
     """
-    d = await load_patient(patient_id)
+    d = await load_patient(patient_id) if patient_id else {}
+
+    if use_demo_patient(d):
+        # Fall back to rich demo patient — typical CKD + diabetes + cardiac risk OPD case
+        dp = DEMO_PATIENT
+        safety = []
+        for c in dp["conditions"]:
+            if "kidney" in c.lower() or "ckd" in c.lower():
+                safety.append("⚠️ Avoid NSAIDs, Gentamicin, Nitrofurantoin, IV contrast")
+            if "diabetes" in c.lower():
+                safety.append("⚠️ Monitor glucose before steroid Rx")
+        return "\n".join([
+            "╔══════════════════════════════════════════════════╗",
+            "║           VAIDYAFLOW 10-SECOND BRIEF             ║",
+            "╚══════════════════════════════════════════════════╝",
+            f"PATIENT : {dp['name']} | {dp['sex']} | DOB {dp['dob']} (age {dp['age']})",
+            f"LAST VISIT: {dp['last_visit']}",
+            "",
+            f"── ACTIVE CONDITIONS ({len(dp['conditions'])}) " + "─"*26,
+            *[f"• {c}" for c in dp["conditions"]],
+            "",
+            f"── CURRENT MEDICATIONS ({len(dp['medications'])}) " + "─"*23,
+            *[f"• {m}" for m in dp["medications"]],
+            "",
+            f"── ALLERGIES ({len(dp['allergies'])}) " + "─"*32,
+            *[f"• {a}" for a in dp["allergies"]],
+            "",
+            f"── ABNORMAL LABS ({len(dp['abnormal_labs'])}) " + "─"*29,
+            *[f"⚠ {l['name']}: {l['value']} ({l['date']})" for l in dp["abnormal_labs"]],
+            "",
+            "── PRESCRIBING SAFETY FLAGS " + "─"*20,
+            *safety,
+            "",
+            "══════════════════════════════════════════════════",
+            "VaidyaFlow | Agents Assemble 2026 | Synthetic data",
+        ])
+
     p    = d["patient"]
     cond = parse_conditions(d["conditions"])
     meds = parse_meds(d["medications"])
@@ -216,16 +302,24 @@ async def get_patient_brief(patient_id: str) -> str:
 
 
 @mcp.tool()
-async def check_prescription_safety(patient_id: str, proposed_medication: str) -> str:
+async def check_prescription_safety(proposed_medication: str, patient_id: str = "") -> str:
     """
-    Check if a proposed medication is safe for this patient given their current
-    conditions, medications, and allergies. Returns a verdict with contraindication
-    reasoning and safer alternatives. Prevents medication errors in busy OPD.
+    Check if a proposed medication is safe for the current patient given their
+    conditions, medications, and allergies. Returns a clear verdict with
+    contraindication reasoning and safer alternatives. Prevents medication errors
+    in busy OPD. patient_id is optional — uses current patient context if available,
+    otherwise demonstrates with a representative high-risk OPD patient.
     """
-    d    = await load_patient(patient_id)
-    cond = parse_conditions(d["conditions"])
-    meds = parse_meds(d["medications"])
-    alrg = parse_allergies(d["allergies"])
+    d    = await load_patient(patient_id) if patient_id else {}
+
+    if use_demo_patient(d):
+        cond = DEMO_PATIENT["conditions"]
+        meds = DEMO_PATIENT["medications"]
+        alrg = DEMO_PATIENT["allergies"]
+    else:
+        cond = parse_conditions(d["conditions"])
+        meds = parse_meds(d["medications"])
+        alrg = parse_allergies(d["allergies"])
 
     warns, alts = drug_check(proposed_medication, cond)
     allergy_hits = [f"🚨 ALLERGY: documented allergy to {a}" for a in alrg
@@ -261,16 +355,24 @@ async def check_prescription_safety(patient_id: str, proposed_medication: str) -
 
 
 @mcp.tool()
-async def get_abnormal_labs(patient_id: str) -> str:
+async def get_abnormal_labs(patient_id: str = "") -> str:
     """
     Retrieve and interpret the patient's most recent lab results, flagging
     abnormal values with clinical context and action guidance. Helps doctors
     spot critical values without manually reviewing every lab result.
+    patient_id is optional — uses current patient or demo patient.
     """
-    d    = await load_patient(patient_id)
-    labs = parse_labs(d["observations"])
-    abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
-    norm = [l for l in labs if l not in abn]
+    d    = await load_patient(patient_id) if patient_id else {}
+
+    if use_demo_patient(d):
+        abn  = DEMO_PATIENT["abnormal_labs"]
+        norm = DEMO_PATIENT["normal_labs"]
+        total = len(abn) + len(norm)
+    else:
+        labs = parse_labs(d["observations"])
+        abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+        norm = [l for l in labs if l not in abn]
+        total = len(labs)
 
     abn_lines = []
     for l in abn:
@@ -280,11 +382,11 @@ async def get_abnormal_labs(patient_id: str) -> str:
     return "\n".join([
         "LAB RESULTS SUMMARY",
         "━"*40,
-        f"Reviewed: {len(labs)}  |  Abnormal: {len(abn)}  |  Normal: {len(norm)}",
+        f"Reviewed: {total}  |  Abnormal: {len(abn)}  |  Normal: {len(norm)}",
         f"Action required: {'YES ⚠️' if abn else 'NO ✓'}",
         "",
         "ABNORMAL VALUES:",
-        *(["\n".join(abn_lines)] or ["✓ All labs within normal limits"]),
+        "\n".join(abn_lines) if abn_lines else "✓ All labs within normal limits",
         "",
         "NORMAL (sample): " + (", ".join(f"{l['name']}: {l['value']}" for l in norm[:4]) or "None"),
         "",
@@ -293,20 +395,33 @@ async def get_abnormal_labs(patient_id: str) -> str:
 
 
 @mcp.tool()
-async def generate_handoff_note(patient_id: str, handoff_notes: str = "") -> str:
+async def generate_handoff_note(patient_id: str = "", handoff_notes: str = "") -> str:
     """
     Generate a structured clinical handoff note for shift change. Summarises
     the patient's key context, active issues, and priority actions for the
     incoming doctor. Prevents critical information loss during transitions —
     a leading cause of preventable adverse events in hospitals.
+    patient_id is optional.
     """
-    d    = await load_patient(patient_id)
-    p    = d["patient"]
-    cond = parse_conditions(d["conditions"])
-    meds = parse_meds(d["medications"])
-    labs = parse_labs(d["observations"])
-    alrg = parse_allergies(d["allergies"])
-    abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
+    d = await load_patient(patient_id) if patient_id else {}
+
+    if use_demo_patient(d):
+        dp = DEMO_PATIENT
+        name, sex, dob = dp["name"], dp["sex"], dp["dob"]
+        cond = dp["conditions"]
+        meds = dp["medications"]
+        alrg = dp["allergies"]
+        abn  = dp["abnormal_labs"]
+    else:
+        p    = d["patient"]
+        name = name_of(p)
+        sex  = p.get("gender", "?").title()
+        dob  = p.get("birthDate", "?")
+        cond = parse_conditions(d["conditions"])
+        meds = parse_meds(d["medications"])
+        labs = parse_labs(d["observations"])
+        alrg = parse_allergies(d["allergies"])
+        abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
 
     rx_flags = []
     for c in cond:
@@ -320,7 +435,7 @@ async def generate_handoff_note(patient_id: str, handoff_notes: str = "") -> str
         "╔══════════════════════════════════════════════════╗",
         "║         VAIDYAFLOW CLINICAL HANDOFF NOTE         ║",
         "╚══════════════════════════════════════════════════╝",
-        f"PATIENT: {name_of(p)} | {p.get('gender','?').title()} | DOB {p.get('birthDate','?')}",
+        f"PATIENT: {name} | {sex} | DOB {dob}",
         "",
         "1. ACTIVE CONDITIONS",
         *([f"   • {c}" for c in cond] or ["   • None"]),
