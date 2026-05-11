@@ -346,28 +346,84 @@ async def load_patient_from_context(explicit_patient_id: str = "") -> dict:
         "allergies":    alrg.get("entry", []),
         "encounters":   enc.get("entry", []),
         "documents":    docs.get("entry", []),
+        "_fhir_base":   base,
+        "_fhir_token":  token,
     }
 
 
-def parse_document_text(documents: list, max_docs: int = 3) -> str:
-    """Extract text content from DocumentReference resources."""
+async def parse_document_text(documents: list, fhir_base: str = None, token: str = None, max_docs: int = 5) -> str:
+    """Extract text content from DocumentReference resources.
+    
+    Handles multiple FHIR storage formats:
+    - attachment.data: base64-encoded inline text
+    - attachment.url: pointer to a separate Binary resource (we fetch it)
+    - text.div: narrative HTML/text
+    """
     import base64
     chunks = []
     for entry in documents[:max_docs]:
         res = entry.get("resource", {})
+        
+        # Try the narrative text (FHIR text.div field)
+        narrative = res.get("text", {}).get("div", "")
+        if narrative:
+            chunks.append(narrative)
+        
+        # Iterate content[] for attachments
         for content in res.get("content", []):
             attach = content.get("attachment", {})
+            
+            # Format 1: base64 inline data
             data = attach.get("data")
             if data:
                 try:
                     text = base64.b64decode(data).decode("utf-8", errors="ignore")
-                    chunks.append(text)
+                    if text.strip():
+                        chunks.append(text)
+                        continue
                 except Exception:
                     pass
-            # Some FHIR servers inline text directly
+            
+            # Format 2: URL pointing to Binary resource — fetch it
+            url = attach.get("url")
+            if url and fhir_base:
+                try:
+                    # URL may be absolute or relative (e.g., "Binary/abc123")
+                    if url.startswith("http"):
+                        fetch_url = url
+                    else:
+                        fetch_url = f"{fhir_base}/{url.lstrip('/')}"
+                    headers = {"Accept": "application/fhir+json"}
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        r = await client.get(fetch_url, headers=headers)
+                        if r.status_code == 200:
+                            # Try parsing as Binary FHIR resource
+                            try:
+                                binary = r.json()
+                                if binary.get("data"):
+                                    text = base64.b64decode(binary["data"]).decode("utf-8", errors="ignore")
+                                    if text.strip():
+                                        chunks.append(text)
+                                        continue
+                            except Exception:
+                                # Plain text response
+                                if r.text.strip():
+                                    chunks.append(r.text)
+                                    continue
+                except Exception:
+                    pass
+            
+            # Format 3: title or description as a fallback
             if attach.get("title"):
                 chunks.append(attach.get("title", ""))
-    return "\n\n---\n\n".join(chunks)
+        
+        # Some FHIR servers put description at top level
+        if res.get("description"):
+            chunks.append(res.get("description"))
+    
+    return "\n\n---\n\n".join(c for c in chunks if c.strip())
 
 
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
@@ -444,12 +500,35 @@ async def debug_show_context() -> str:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     r = await client.get(f"{base}/DocumentReference?patient={pid}", headers=hdrs)
+                    body_preview = r.text[:2000]
                     lines += [f"  GET DocumentReference?patient={pid}",
                               f"    Status: {r.status_code}",
-                              f"    Body  : {r.text[:300]}",
+                              f"    Body (first 2000 chars):",
+                              f"    {body_preview}",
                               ""]
             except Exception as e:
                 lines += [f"  DocumentReference fetch error: {e!r}", ""]
+            
+            # Also test our actual document parser
+            try:
+                d = await load_patient_from_context(pid)
+                docs = d.get("documents", [])
+                lines += [
+                    "── DOCUMENT PARSER TEST ──",
+                    f"  Documents returned: {len(docs)}",
+                ]
+                parsed = await parse_document_text(docs, fhir_base=base, token=token)
+                if parsed:
+                    lines += [
+                        f"  Parsed text length: {len(parsed)} chars",
+                        f"  Parsed text preview (first 1500 chars):",
+                        f"  {parsed[:1500]}",
+                    ]
+                else:
+                    lines += ["  ⚠️ Parser returned EMPTY string — documents exist but format not recognized"]
+                lines += [""]
+            except Exception as e:
+                lines += [f"  Parser test error: {e!r}", ""]
         else:
             lines += ["(No patient ID — skipping FHIR fetch tests)", ""]
         
@@ -476,7 +555,7 @@ async def get_patient_brief(patient_id: str = "") -> str:
     labs = parse_labs(d["observations"])
     alrg = parse_allergies(d["allergies"])
     abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
-    doc_text = parse_document_text(d.get("documents", []))
+    doc_text = await parse_document_text(d.get("documents", []), fhir_base=d.get("_fhir_base"), token=d.get("_fhir_token"))
     last = (d["encounters"][0].get("resource",{}).get("period",{}).get("start","N/A")[:10]
             if d["encounters"] else "No visits on record")
 
@@ -533,7 +612,7 @@ async def check_prescription_safety(proposed_medication: str, patient_id: str = 
     cond = parse_conditions(d["conditions"])
     meds = parse_meds(d["medications"])
     alrg = parse_allergies(d["allergies"])
-    doc_text = parse_document_text(d.get("documents", []))
+    doc_text = await parse_document_text(d.get("documents", []), fhir_base=d.get("_fhir_base"), token=d.get("_fhir_token"))
 
     # Also scan clinical notes for conditions/allergies mentioned in free text
     doc_lower = doc_text.lower()
@@ -645,7 +724,7 @@ async def generate_handoff_note(patient_id: str = "", handoff_notes: str = "") -
     labs = parse_labs(d["observations"])
     alrg = parse_allergies(d["allergies"])
     abn  = [l for l in labs if l["flag"] in ("H","L","HH","LL","A")]
-    doc_text = parse_document_text(d.get("documents", []))
+    doc_text = await parse_document_text(d.get("documents", []), fhir_base=d.get("_fhir_base"), token=d.get("_fhir_token"))
 
     if not p:
         return "Unable to load patient data for handoff. No patient context available."
