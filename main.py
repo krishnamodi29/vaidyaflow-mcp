@@ -181,16 +181,22 @@ LAB_NOTES = {
 from starlette.requests import Request
 
 def get_sharp_context() -> dict:
-    """Read SHARP context from the current HTTP request headers."""
+    """Read SHARP context from the current HTTP request headers.
+    
+    Per Prompt Opinion's official SHARP spec, the platform passes:
+      - x-fhir-server-url  : base URL of the FHIR server
+      - x-fhir-access-token: bearer token for that FHIR server  
+      - x-patient-id       : ID of the currently-selected patient
+    """
     try:
         req: Request = mcp.get_context().request_context.request
         if req is None:
             return {}
         headers = req.headers
         return {
-            "fhir_base":  headers.get("x-fhir-base-url") or headers.get("x-fhir-base"),
-            "fhir_token": headers.get("x-fhir-token") or headers.get("authorization", "").replace("Bearer ", ""),
-            "patient_id": headers.get("x-patient-id") or headers.get("x-fhir-patient-id"),
+            "fhir_base":  headers.get("x-fhir-server-url"),
+            "fhir_token": headers.get("x-fhir-access-token"),
+            "patient_id": headers.get("x-patient-id"),
         }
     except Exception:
         return {}
