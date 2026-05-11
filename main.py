@@ -253,6 +253,40 @@ def parse_document_text(documents: list, max_docs: int = 3) -> str:
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
+async def debug_show_context() -> str:
+    """
+    Diagnostic tool. Returns all HTTP headers and detected SHARP context from
+    the current request. Use this to verify what Prompt Opinion is sending so
+    we know the exact header names for patient ID, FHIR base URL, and token.
+    """
+    try:
+        req: Request = mcp.get_context().request_context.request
+        if req is None:
+            return "No HTTP request in context (running in stdio mode?)"
+        headers = dict(req.headers)
+        # Redact any tokens
+        redacted = {k: ("***REDACTED***" if "token" in k.lower() or "auth" in k.lower() else v)
+                    for k, v in headers.items()}
+        ctx = get_sharp_context()
+        lines = [
+            "═══════════ VAIDYAFLOW DEBUG — REQUEST CONTEXT ═══════════",
+            "",
+            "ALL HTTP HEADERS:",
+            *[f"  {k}: {v}" for k, v in sorted(redacted.items())],
+            "",
+            "DETECTED SHARP CONTEXT:",
+            f"  FHIR base URL : {ctx.get('fhir_base')  or '(not detected)'}",
+            f"  FHIR token    : {'***present***' if ctx.get('fhir_token') else '(not detected)'}",
+            f"  Patient ID    : {ctx.get('patient_id') or '(not detected)'}",
+            "",
+            "═══════════════════════════════════════════════════════════",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading request context: {e!r}"
+
+
+@mcp.tool()
 async def get_patient_brief(patient_id: str = "") -> str:
     """
     Generate a 10-second patient brief for the doctor seeing this patient.
