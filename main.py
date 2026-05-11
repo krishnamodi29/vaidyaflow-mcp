@@ -27,41 +27,25 @@ mcp = FastMCP(
     )
 )
 
-# ── Declare PromptOpinion FHIR-context extension ──────────────────────────────
+# ── PromptOpinion FHIR-context extension scopes ───────────────────────────────
 # Per https://docs.promptopinion.ai/fhir-context/mcp-fhir-context, our MCP
 # server must advertise the `ai.promptopinion/fhir-context` extension during
-# the `initialize` handshake. Only then will PO send us the SHARP headers
-# (X-FHIR-Server-URL, X-FHIR-Access-Token, X-Patient-ID) on every tool call.
-#
-# We monkey-patch create_initialization_options on the underlying low-level
-# server to inject the experimental capability with our requested SMART scopes.
+# the `initialize` handshake under capabilities.extensions (NOT experimental).
+# We inject this via ASGI middleware that rewrites the initialize response.
 
-_PO_FHIR_SCOPES = {
-    "scopes": [
-        {"name": "patient/Patient.rs",            "required": True},
-        {"name": "patient/Condition.rs"},
-        {"name": "patient/MedicationRequest.rs"},
-        {"name": "patient/Observation.rs"},
-        {"name": "patient/AllergyIntolerance.rs"},
-        {"name": "patient/Encounter.rs"},
-        {"name": "patient/DocumentReference.rs"},
-    ]
+_PO_FHIR_EXTENSION = {
+    "ai.promptopinion/fhir-context": {
+        "scopes": [
+            {"name": "patient/Patient.rs",            "required": True},
+            {"name": "patient/Condition.rs"},
+            {"name": "patient/MedicationRequest.rs"},
+            {"name": "patient/Observation.rs"},
+            {"name": "patient/AllergyIntolerance.rs"},
+            {"name": "patient/Encounter.rs"},
+            {"name": "patient/DocumentReference.rs"},
+        ]
+    }
 }
-
-_original_create_init_opts = mcp._mcp_server.create_initialization_options
-
-def _patched_create_initialization_options(
-    notification_options=None,
-    experimental_capabilities=None,
-):
-    caps = dict(experimental_capabilities or {})
-    caps["ai.promptopinion/fhir-context"] = _PO_FHIR_SCOPES
-    return _original_create_init_opts(
-        notification_options=notification_options,
-        experimental_capabilities=caps,
-    )
-
-mcp._mcp_server.create_initialization_options = _patched_create_initialization_options
 
 # ── FHIR helpers ──────────────────────────────────────────────────────────────
 
@@ -219,20 +203,112 @@ import contextvars
 _sharp_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("sharp_ctx", default={})
 
 
+import json as _json
+
 class SharpContextMiddleware:
-    """ASGI middleware: reads SHARP headers into ContextVar on every request."""
+    """
+    ASGI middleware that does two things:
+    1. Reads SHARP headers (x-fhir-server-url etc.) into a ContextVar for tools.
+    2. Intercepts outgoing JSON-RPC `initialize` responses and injects the
+       `ai.promptopinion/fhir-context` extension under capabilities.extensions
+       so PromptOpinion recognizes our server as FHIR-context-aware.
+    """
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            raw_headers = {k.lower(): v for k, v in scope.get("headers", [])}
-            _sharp_ctx.set({
-                "fhir_base":  raw_headers.get(b"x-fhir-server-url",   b"").decode() or None,
-                "fhir_token": raw_headers.get(b"x-fhir-access-token", b"").decode() or None,
-                "patient_id": raw_headers.get(b"x-patient-id",        b"").decode() or None,
-            })
-        await self.app(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Capture SHARP headers into ContextVar
+        raw_headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        _sharp_ctx.set({
+            "fhir_base":  raw_headers.get(b"x-fhir-server-url",   b"").decode() or None,
+            "fhir_token": raw_headers.get(b"x-fhir-access-token", b"").decode() or None,
+            "patient_id": raw_headers.get(b"x-patient-id",        b"").decode() or None,
+        })
+
+        # Wrap send to intercept the initialize response body
+        response_body = bytearray()
+        start_message = {"headers": []}
+
+        async def send_wrapper(message):
+            nonlocal start_message
+            if message["type"] == "http.response.start":
+                start_message = dict(message)
+                start_message["headers"] = list(message.get("headers", []))
+                # Don't forward yet — wait to see if we need to modify content length
+                return
+            elif message["type"] == "http.response.body":
+                response_body.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    # Try to parse & modify the body
+                    modified_body = _maybe_inject_extensions(bytes(response_body))
+                    # Update content-length header
+                    new_headers = [
+                        (k, v) for k, v in start_message["headers"]
+                        if k.lower() != b"content-length"
+                    ]
+                    new_headers.append((b"content-length", str(len(modified_body)).encode()))
+                    start_message["headers"] = new_headers
+                    await send(start_message)
+                    await send({"type": "http.response.body", "body": modified_body, "more_body": False})
+                return
+            else:
+                await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _maybe_inject_extensions(body: bytes) -> bytes:
+    """If the body is a JSON-RPC initialize response, inject the FHIR extension.
+    Handles both plain JSON and SSE (data: ...\n\n) framing."""
+    try:
+        text = body.decode("utf-8", errors="ignore")
+    except Exception:
+        return body
+
+    # SSE framing: lines like "event: message\ndata: {json}\n\n"
+    if text.lstrip().startswith("event:") or text.lstrip().startswith("data:"):
+        modified_lines = []
+        for line in text.split("\n"):
+            if line.startswith("data: "):
+                payload = line[6:]
+                modified_payload = _try_modify_jsonrpc(payload)
+                modified_lines.append("data: " + modified_payload)
+            else:
+                modified_lines.append(line)
+        return "\n".join(modified_lines).encode("utf-8")
+
+    # Plain JSON
+    return _try_modify_jsonrpc(text).encode("utf-8")
+
+
+def _try_modify_jsonrpc(text: str) -> str:
+    try:
+        obj = _json.loads(text)
+    except Exception:
+        return text
+    # Only modify initialize responses
+    if not isinstance(obj, dict):
+        return text
+    result = obj.get("result")
+    if not isinstance(result, dict):
+        return text
+    caps = result.get("capabilities")
+    if not isinstance(caps, dict):
+        return text
+    # Only do this for the initialize response (which has serverInfo + protocolVersion)
+    if "protocolVersion" not in result and "serverInfo" not in result:
+        return text
+    # Inject extensions
+    extensions = caps.get("extensions", {})
+    if not isinstance(extensions, dict):
+        extensions = {}
+    extensions.update(_PO_FHIR_EXTENSION)
+    caps["extensions"] = extensions
+    return _json.dumps(obj)
 
 
 def get_sharp_context() -> dict:
